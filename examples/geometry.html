@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>chottoGPU — 3D Geometry with Depth</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas></canvas>
+<script type="module">
+import { chottoGPU } from '../chottoGPU.js';
+
+const shaderWGSL = /* wgsl */`
+struct Uniforms {
+  mvp: mat4x4f,
+  model: mat4x4f,
+  lightDir: vec3f,
+  time: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VIn {
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+};
+
+struct VOut {
+  @builtin(position) position: vec4f,
+  @location(0) normal: vec3f,
+  @location(1) worldPos: vec3f,
+};
+
+@vertex fn vs(vin: VIn) -> VOut {
+  var out: VOut;
+  out.position = u.mvp * vec4f(vin.position, 1.0);
+  out.normal = (u.model * vec4f(vin.normal, 0.0)).xyz;
+  out.worldPos = (u.model * vec4f(vin.position, 1.0)).xyz;
+  return out;
+}
+
+@fragment fn fs(v: VOut) -> @location(0) vec4f {
+  let n = normalize(v.normal);
+  let l = normalize(u.lightDir);
+
+  let diff = max(dot(n, l), 0.0);
+  let ambient = 0.15;
+
+  // Simple color based on normal
+  let baseColor = normalize(abs(n)) * 0.5 + 0.5;
+  let col = baseColor * (ambient + diff * 0.85);
+
+  return vec4f(pow(col, vec3f(0.4545)), 1.0);
+}`;
+
+// Generate cube geometry
+function createCube() {
+  const positions = [];
+  const normals = [];
+  const indices = [];
+
+  const faces = [
+    { dir: [ 0,  0,  1], up: [0, 1, 0] }, // front
+    { dir: [ 0,  0, -1], up: [0, 1, 0] }, // back
+    { dir: [ 1,  0,  0], up: [0, 1, 0] }, // right
+    { dir: [-1,  0,  0], up: [0, 1, 0] }, // left
+    { dir: [ 0,  1,  0], up: [0, 0,-1] }, // top
+    { dir: [ 0, -1,  0], up: [0, 0, 1] }, // bottom
+  ];
+
+  for (const face of faces) {
+    const [dx, dy, dz] = face.dir;
+    const [ux, uy, uz] = face.up;
+    // right = up x dir
+    const rx = uy * dz - uz * dy;
+    const ry = uz * dx - ux * dz;
+    const rz = ux * dy - uy * dx;
+
+    const baseIndex = positions.length / 3;
+
+    // 4 corners
+    for (const [su, sv] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+      positions.push(
+        dx * 0.5 + rx * su * 0.5 + ux * sv * 0.5,
+        dy * 0.5 + ry * su * 0.5 + uy * sv * 0.5,
+        dz * 0.5 + rz * su * 0.5 + uz * sv * 0.5
+      );
+      normals.push(dx, dy, dz);
+    }
+
+    indices.push(
+      baseIndex, baseIndex + 1, baseIndex + 2,
+      baseIndex, baseIndex + 2, baseIndex + 3
+    );
+  }
+
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    indices: new Uint16Array(indices),
+  };
+}
+
+// Matrix utilities
+function mat4Perspective(fov, aspect, near, far) {
+  const f = 1 / Math.tan(fov / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+
+function mat4LookAt(eye, center, up) {
+  const zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  const zLen = Math.hypot(zx, zy, zz);
+  const z = [zx / zLen, zy / zLen, zz / zLen];
+
+  const xx = up[1] * z[2] - up[2] * z[1];
+  const xy = up[2] * z[0] - up[0] * z[2];
+  const xz = up[0] * z[1] - up[1] * z[0];
+  const xLen = Math.hypot(xx, xy, xz);
+  const x = [xx / xLen, xy / xLen, xz / xLen];
+
+  const y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+
+  return new Float32Array([
+    x[0], y[0], z[0], 0,
+    x[1], y[1], z[1], 0,
+    x[2], y[2], z[2], 0,
+    -(x[0] * eye[0] + x[1] * eye[1] + x[2] * eye[2]),
+    -(y[0] * eye[0] + y[1] * eye[1] + y[2] * eye[2]),
+    -(z[0] * eye[0] + z[1] * eye[1] + z[2] * eye[2]),
+    1,
+  ]);
+}
+
+function mat4RotateY(angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return new Float32Array([
+    c, 0, -s, 0,
+    0, 1, 0, 0,
+    s, 0, c, 0,
+    0, 0, 0, 1,
+  ]);
+}
+
+function mat4RotateX(angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return new Float32Array([
+    1, 0, 0, 0,
+    0, c, s, 0,
+    0, -s, c, 0,
+    0, 0, 0, 1,
+  ]);
+}
+
+function mat4Multiply(a, b) {
+  const out = new Float32Array(16);
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      out[j * 4 + i] = a[i] * b[j * 4] + a[4 + i] * b[j * 4 + 1] +
+                       a[8 + i] * b[j * 4 + 2] + a[12 + i] * b[j * 4 + 3];
+    }
+  }
+  return out;
+}
+
+const canvas = document.querySelector('canvas');
+const gpu = await chottoGPU(canvas);
+
+let fbo = gpu.framebuffer(canvas.width, canvas.height, { depth: true, samples: 4 });
+
+gpu.fitWindow((w, h) => {
+  fbo.resize(w, h);
+});
+
+const cube = createCube();
+
+// Interleaved vertex buffer: position (vec3) + normal (vec3) = 24 bytes per vertex
+const vertexCount = cube.positions.length / 3;
+const interleavedData = new Float32Array(vertexCount * 6);
+for (let i = 0; i < vertexCount; i++) {
+  interleavedData[i * 6 + 0] = cube.positions[i * 3 + 0];
+  interleavedData[i * 6 + 1] = cube.positions[i * 3 + 1];
+  interleavedData[i * 6 + 2] = cube.positions[i * 3 + 2];
+  interleavedData[i * 6 + 3] = cube.normals[i * 3 + 0];
+  interleavedData[i * 6 + 4] = cube.normals[i * 3 + 1];
+  interleavedData[i * 6 + 5] = cube.normals[i * 3 + 2];
+}
+
+const vertexBuffer = gpu.buffer(interleavedData, { vertex: true });
+const indexBuffer = gpu.buffer(cube.indices, { index: true });
+
+// Uniform buffer: mat4 mvp (64) + mat4 model (64) + vec3 lightDir (12) + f32 time (4) = 144 bytes
+const ubo = gpu.buffer(new Float32Array(36), { uniform: true });
+
+const pipe = gpu.pipeline({
+  vertex: shaderWGSL,
+  fragment: shaderWGSL,
+  vertexBuffers: [{
+    arrayStride: 24,
+    attributes: [
+      { shaderLocation: 0, offset: 0, format: 'float32x3' },  // position
+      { shaderLocation: 1, offset: 12, format: 'float32x3' }, // normal
+    ],
+  }],
+  depthTest: true,
+  cullMode: 'back',
+  samples: 4,
+});
+
+const bg = gpu.device.createBindGroup({
+  layout: pipe.getBindGroupLayout(0),
+  entries: [{ binding: 0, resource: { buffer: ubo.buffer } }],
+});
+
+// Blit shader to copy FBO to screen
+const blitWGSL = /* wgsl */`
+@group(0) @binding(0) var samp: sampler;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+
+@fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+  return textureSample(tex, samp, uv);
+}`;
+
+const blitPipe = gpu.pipeline({ vertex: gpu.FULLSCREEN_VERT, fragment: blitWGSL });
+const blitLayout = blitPipe.getBindGroupLayout(0);
+
+(function render() {
+  const t = performance.now() * 0.001;
+  const aspect = canvas.width / canvas.height;
+
+  const proj = mat4Perspective(Math.PI / 4, aspect, 0.1, 100);
+  const view = mat4LookAt([0, 1.5, 4], [0, 0, 0], [0, 1, 0]);
+  const model = mat4Multiply(mat4RotateY(t * 0.5), mat4RotateX(t * 0.3));
+  const mvp = mat4Multiply(mat4Multiply(proj, view), model);
+
+  const uniformData = new Float32Array(36);
+  uniformData.set(mvp, 0);
+  uniformData.set(model, 16);
+  uniformData.set([0.5, 0.8, 0.3], 32); // lightDir
+  uniformData[35] = t;
+  ubo.write(uniformData);
+
+  gpu.frame(() => {
+    // Render cube to FBO with depth
+    gpu.pass({ target: fbo, clear: [0.05, 0.05, 0.08, 1] }, (p) => {
+      p.setPipeline(pipe);
+      p.setBindGroup(0, bg);
+      p.setVertexBuffer(0, vertexBuffer.buffer);
+      p.setIndexBuffer(indexBuffer.buffer, 'uint16');
+      p.drawIndexed(cube.indices.length);
+    });
+
+    // Blit to screen
+    gpu.pass((p) => {
+      p.setPipeline(blitPipe);
+      p.setBindGroup(0, gpu.device.createBindGroup({
+        layout: blitLayout,
+        entries: [
+          { binding: 0, resource: gpu.sampler },
+          { binding: 1, resource: fbo.view },
+        ],
+      }));
+      p.draw(3);
+    });
+  });
+
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>

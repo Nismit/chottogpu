@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>chottoGPU — GPGPU Buffer Readback</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    padding: 2rem;
+    min-height: 100vh;
+  }
+  h1 { margin-bottom: 1rem; font-size: 1.5rem; }
+  .controls {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+  }
+  button {
+    padding: 0.5rem 1rem;
+    font-size: 1rem;
+    background: #4a4a6a;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  button:hover { background: #5a5a7a; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .info {
+    background: #2a2a4a;
+    padding: 1rem;
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    font-family: monospace;
+    font-size: 0.9rem;
+    line-height: 1.6;
+  }
+  .result {
+    background: #0a0a1a;
+    padding: 1rem;
+    border-radius: 8px;
+    font-family: monospace;
+    font-size: 0.85rem;
+    max-height: 400px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  canvas { display: none; }
+</style>
+</head>
+<body>
+<canvas></canvas>
+<h1>GPGPU: Compute + Buffer Readback</h1>
+
+<div class="info">
+  This demo shows how to use compute shaders for parallel computation
+  and read results back to JavaScript using <code>buffer.read()</code>.<br><br>
+  <strong>Operations:</strong><br>
+  - Vector addition: C[i] = A[i] + B[i]<br>
+  - Parallel reduction: sum all elements<br>
+  - Prime sieve: find primes up to N
+</div>
+
+<div class="controls">
+  <button id="btn-add">Vector Add (1M elements)</button>
+  <button id="btn-reduce">Parallel Sum (1M elements)</button>
+  <button id="btn-primes">Prime Sieve (up to 100K)</button>
+</div>
+
+<div class="result" id="result">Click a button to run a GPU computation...</div>
+
+<script type="module">
+import { chottoGPU } from '../chottoGPU.js';
+
+const canvas = document.querySelector('canvas');
+const gpu = await chottoGPU(canvas);
+const resultDiv = document.getElementById('result');
+
+function log(text) {
+  resultDiv.textContent = text;
+}
+
+// ─── Vector Addition ───
+
+const vectorAddWGSL = /* wgsl */`
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x;
+  if (i < arrayLength(&a)) {
+    c[i] = a[i] + b[i];
+  }
+}`;
+
+document.getElementById('btn-add').onclick = async () => {
+  const N = 1_000_000;
+  log(`Creating ${N.toLocaleString()} element vectors...`);
+
+  const dataA = new Float32Array(N);
+  const dataB = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    dataA[i] = i;
+    dataB[i] = i * 2;
+  }
+
+  const bufA = gpu.buffer(dataA, { storage: true });
+  const bufB = gpu.buffer(dataB, { storage: true });
+  const bufC = gpu.buffer(N * 4, { storage: true });
+
+  const pipe = gpu.compute({ shader: vectorAddWGSL });
+  const bg = gpu.device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bufA.buffer } },
+      { binding: 1, resource: { buffer: bufB.buffer } },
+      { binding: 2, resource: { buffer: bufC.buffer } },
+    ],
+  });
+
+  const t0 = performance.now();
+
+  gpu.dispatch((p) => {
+    p.setPipeline(pipe);
+    p.setBindGroup(0, bg);
+    p.dispatchWorkgroups(Math.ceil(N / 256));
+  });
+
+  const result = new Float32Array(N);
+  await bufC.read(result);
+
+  const elapsed = (performance.now() - t0).toFixed(2);
+
+  // Verify
+  let correct = true;
+  for (let i = 0; i < 10; i++) {
+    if (result[i] !== dataA[i] + dataB[i]) correct = false;
+  }
+
+  log(
+    `Vector Addition Complete!\n` +
+    `Time: ${elapsed}ms\n` +
+    `Elements: ${N.toLocaleString()}\n\n` +
+    `First 10 results:\n` +
+    Array.from(result.slice(0, 10)).map((v, i) =>
+      `  C[${i}] = A[${i}] + B[${i}] = ${dataA[i]} + ${dataB[i]} = ${v}`
+    ).join('\n') +
+    `\n\nLast 5 results:\n` +
+    Array.from(result.slice(-5)).map((v, i) =>
+      `  C[${N - 5 + i}] = ${v}`
+    ).join('\n') +
+    `\n\nVerification: ${correct ? 'PASSED' : 'FAILED'}`
+  );
+
+  bufA.dispose();
+  bufB.dispose();
+  bufC.dispose();
+};
+
+// ─── Parallel Reduction (Sum) ───
+
+const reduceWGSL = /* wgsl */`
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+var<workgroup> shared: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  @builtin(workgroup_id) wid: vec3u,
+) {
+  let i = gid.x;
+  let local_id = lid.x;
+
+  // Load into shared memory
+  if (i < arrayLength(&input)) {
+    shared[local_id] = input[i];
+  } else {
+    shared[local_id] = 0.0;
+  }
+  workgroupBarrier();
+
+  // Tree reduction in shared memory
+  for (var stride = 128u; stride > 0u; stride >>= 1u) {
+    if (local_id < stride) {
+      shared[local_id] += shared[local_id + stride];
+    }
+    workgroupBarrier();
+  }
+
+  // Write result
+  if (local_id == 0u) {
+    output[wid.x] = shared[0];
+  }
+}`;
+
+document.getElementById('btn-reduce').onclick = async () => {
+  const N = 1_000_000;
+  log(`Summing ${N.toLocaleString()} elements on GPU...`);
+
+  const data = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    data[i] = 1; // Sum of 1s = N (easy to verify)
+  }
+
+  const t0 = performance.now();
+
+  // Multi-pass reduction
+  let currentData = data;
+  let currentSize = N;
+
+  while (currentSize > 1) {
+    const numWorkgroups = Math.ceil(currentSize / 256);
+    const inputBuf = gpu.buffer(currentData, { storage: true });
+    const outputBuf = gpu.buffer(numWorkgroups * 4, { storage: true });
+
+    const pipe = gpu.compute({ shader: reduceWGSL });
+    const bg = gpu.device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: inputBuf.buffer } },
+        { binding: 1, resource: { buffer: outputBuf.buffer } },
+      ],
+    });
+
+    gpu.dispatch((p) => {
+      p.setPipeline(pipe);
+      p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(numWorkgroups);
+    });
+
+    const result = new Float32Array(numWorkgroups);
+    await outputBuf.read(result);
+
+    inputBuf.dispose();
+    outputBuf.dispose();
+
+    currentData = result;
+    currentSize = numWorkgroups;
+  }
+
+  const elapsed = (performance.now() - t0).toFixed(2);
+  const sum = currentData[0];
+  const expected = N;
+
+  log(
+    `Parallel Reduction Complete!\n` +
+    `Time: ${elapsed}ms\n` +
+    `Elements: ${N.toLocaleString()}\n\n` +
+    `GPU Sum: ${sum.toLocaleString()}\n` +
+    `Expected: ${expected.toLocaleString()}\n\n` +
+    `Verification: ${sum === expected ? 'PASSED' : 'FAILED'}`
+  );
+};
+
+// ─── Prime Sieve ───
+
+const sieveWGSL = /* wgsl */`
+struct Params {
+  n: u32,
+  currentPrime: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> sieve: array<u32>;
+@group(0) @binding(1) var<uniform> u: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x;
+  let p = u.currentPrime;
+  let multiple = p * (2u + i); // Start from 2*p
+
+  if (multiple < u.n) {
+    sieve[multiple] = 0u; // Mark as not prime
+  }
+}`;
+
+document.getElementById('btn-primes').onclick = async () => {
+  const N = 100_000;
+  log(`Finding primes up to ${N.toLocaleString()} using GPU sieve...`);
+
+  // Initialize sieve: 1 = potentially prime, 0 = not prime
+  const sieveData = new Uint32Array(N);
+  sieveData.fill(1);
+  sieveData[0] = 0; // 0 is not prime
+  sieveData[1] = 0; // 1 is not prime
+
+  const sieveBuf = gpu.buffer(sieveData, { storage: true });
+  const paramsBuf = gpu.buffer(new Uint32Array(4), { uniform: true });
+
+  const pipe = gpu.compute({ shader: sieveWGSL });
+  const bg = gpu.device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: sieveBuf.buffer } },
+      { binding: 1, resource: { buffer: paramsBuf.buffer } },
+    ],
+  });
+
+  const t0 = performance.now();
+
+  // Sieve of Eratosthenes on GPU
+  const sqrtN = Math.floor(Math.sqrt(N));
+  for (let p = 2; p <= sqrtN; p++) {
+    // Read current state to check if p is still marked prime
+    const check = new Uint32Array(N);
+    await sieveBuf.read(check);
+
+    if (check[p] === 0) continue; // Skip if already marked
+
+    // Mark multiples of p
+    const numMultiples = Math.ceil((N - 2 * p) / p);
+    if (numMultiples <= 0) continue;
+
+    paramsBuf.write(new Uint32Array([N, p, 0, 0]));
+
+    gpu.dispatch((pass) => {
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil(numMultiples / 256));
+    });
+  }
+
+  // Read final result
+  const result = new Uint32Array(N);
+  await sieveBuf.read(result);
+
+  const elapsed = (performance.now() - t0).toFixed(2);
+
+  // Collect primes
+  const primes = [];
+  for (let i = 2; i < N; i++) {
+    if (result[i] === 1) primes.push(i);
+  }
+
+  log(
+    `Prime Sieve Complete!\n` +
+    `Time: ${elapsed}ms\n` +
+    `Range: 2 to ${N.toLocaleString()}\n` +
+    `Primes found: ${primes.length.toLocaleString()}\n\n` +
+    `First 20 primes:\n  ${primes.slice(0, 20).join(', ')}\n\n` +
+    `Last 20 primes:\n  ${primes.slice(-20).join(', ')}\n\n` +
+    `Largest prime under ${N.toLocaleString()}: ${primes[primes.length - 1]}`
+  );
+
+  sieveBuf.dispose();
+  paramsBuf.dispose();
+};
+</script>
+</body>
+</html>
