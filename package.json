@@ -2,6 +2,9 @@
   "name": "chottogpu",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": "./chottoGPU.js"
+  },
   "scripts": {
     "dev": "vite",
     "test": "playwright test"
